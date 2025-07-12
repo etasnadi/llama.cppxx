@@ -655,25 +655,56 @@ struct test_case {
         // determine number of runs
         int n_runs;
         bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+
+        // how many nodes are added by each op
+        uint32_t nodes_per_op = 1;
+        if(op_desc(out) == "CONV_2D_INDIRECT_IMPL"){
+            nodes_per_op = 8;
+        }
+
         if (op_flops(out) > 0) {
             // based on flops
             const uint64_t GFLOP = 1000 * 1000 * 1000;
             const uint64_t target_flops_cpu =   8ULL * GFLOP;
             const uint64_t target_flops_gpu = 100ULL * GFLOP;
             uint64_t target_flops = is_cpu ? target_flops_cpu : target_flops_gpu;
-            n_runs = std::min<int>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_flops / op_flops(out)) + 1;
+            n_runs = std::min<int>((ggml_graph_size(gf) - ggml_graph_n_nodes(gf))/nodes_per_op, target_flops / op_flops(out)) + 1;
         } else {
             // based on memory size
             const size_t GB = 1ULL << 30;
             const size_t target_size_cpu =  8 * GB;
             const size_t target_size_gpu = 32 * GB;
             size_t target_size = is_cpu ? target_size_cpu : target_size_gpu;
-            n_runs = std::min<int>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
+            n_runs = std::min<int>((ggml_graph_size(gf) - ggml_graph_n_nodes(gf))/nodes_per_op, target_size / op_size(out)) + 1;
         }
 
         // duplicate the op
         for (int i = 1; i < n_runs; i++) {
             ggml_graph_add_node(gf, out);
+            
+            if(op_desc(out) == "CONV_2D_INDIRECT_IMPL"){
+                /*
+                TODO: add a permanent solution! E.g. return the list of tensors 
+                needed to add for computing the op in build_graph().
+                
+                Adds the full ggml_conv_2d() computation graph, not just the output!
+                    * cont      (out)
+                    * cont      (out->src[0])
+                    * permute   (out->src[0]->...)
+                    * reshape
+                    * mul_mat
+                        * reshape
+                            * im2col
+                        * reshape
+                */
+                ggml_graph_add_node(gf, out->src[0]);                                           // cont
+                ggml_graph_add_node(gf, out->src[0]->src[0]);                                   // permute
+                ggml_graph_add_node(gf, out->src[0]->src[0]->src[0]);                           // reshape
+                ggml_graph_add_node(gf, out->src[0]->src[0]->src[0]->src[0]);                   // mul_mat
+                ggml_graph_add_node(gf, out->src[0]->src[0]->src[0]->src[0]->src[0]);           // reshape
+                ggml_graph_add_node(gf, out->src[0]->src[0]->src[0]->src[0]->src[0]->src[0]);   // im2col
+                ggml_graph_add_node(gf, out->src[0]->src[0]->src[0]->src[0]->src[1]);           // reshape
+            }
         }
 
         // calculate memory
@@ -4430,21 +4461,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         return (ins + 2 * p - d * (ks - 1) - 1) / s + 1;
     };
 
-    uint32_t s0 = 3;
+    //uint32_t s0 = 3;
     uint32_t s1 = 5;
     uint32_t p0 = 5;
-    uint32_t p1 = 2;
+    //uint32_t p1 = 2;
     uint32_t d0 = 2;
     uint32_t d1 = 4;
 
-    for(uint32_t Cin : {1, 25}){
-        for(uint32_t Cout : {1, 12}){
-            for(uint32_t KH : {1, 2, 3, 11}){
-                for(uint32_t KW : {1, 2, 3, 11}){
-                    for(uint32_t H : {1, 100}){
-                        for(uint32_t W : {1, 100}){
-                            if(calc_conv_output_size(W, KW, s0, p0, d0) > 0 && calc_conv_output_size(H, KH, s1, p1, d1) > 0){
-                                test_cases.emplace_back(new test_conv_2d({W, H, Cin, 2}, {KW, KH, Cin, Cout}, s0, s1, p0, p1, d0, d1, false, true));
+    for(uint32_t s0: {1, 3}){
+        for(uint32_t p1: {2, 5}){
+            for(uint32_t Cin : {1, 25}){
+                for(uint32_t Cout : {1, 12}){
+                    for(uint32_t KH : {1, 2, 3, 11}){
+                        for(uint32_t KW : {1, 2, 3, 11}){
+                            for(uint32_t H : {1, 133}){
+                                for(uint32_t W : {1, 258}){
+                                    if(calc_conv_output_size(W, KW, s0, p0, d0) > 0 && calc_conv_output_size(H, KH, s1, p1, d1) > 0){
+                                        test_cases.emplace_back(new test_conv_2d({W, H, Cin, 2}, {KW, KH, Cin, Cout}, s0, s1, p0, p1, d0, d1, false, true));
+                                    }
+                                }
                             }
                         }
                     }
@@ -4452,6 +4487,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    uint32_t iwh_idx = 0;
+    uint32_t kwh_idx = 1;
+    uint32_t Cout_idx = 2;
+    uint32_t Cin_idx = 3;
+    uint32_t B_idx = 4;
+    std::vector<std::array<int, 5>> cases = {
+        //{IWH, KWH, Cout, Cin, B}
+        // K=CRS=NPQ=4096 conv2d matmul performance
+        {19, 4, 4096, 256, 16}, // --> fails
+        // K=128, CRS=128, NPQ=4096
+        {19, 4, 128, 8, 16},
+        // K=130, CRS=128, NPQ=4096
+        {19, 4, 130, 8, 16},
+        // Edge case: K x CRS is small
+        {19, 2, 4, 4, 16},
+        // A ConvNet's first layer
+        {224, 3, 8, 3, 1},
+        // A ConvNet's first layer with 2x2 convolution, and 1 channel
+        {224, 2, 8, 1, 1},
+        // A ConvNet's first layer with 2x2 convolution, and 1 channel, several images in the batch
+        {224, 2, 8, 1, 8},
+        // A middle layer of a ConvNet
+        {58, 3, 64, 32, 1},
+        // A middle layer of a ConvNet, several images in the batch
+        {58, 3, 64, 32, 8},
+        // A deep layer of a ConvNet, several images in the batch
+        {16, 3, 256, 128, 8}
+    };
+
+    for(auto act_case : cases){
+        test_cases.emplace_back(new test_conv_2d({act_case[iwh_idx], act_case[iwh_idx], act_case[Cin_idx], act_case[B_idx]}, {act_case[kwh_idx], act_case[kwh_idx], act_case[Cin_idx], act_case[Cout_idx]}, 1, 1, 0, 0, 1, 1, false, true));
+    }    
 
     // sycl backend will limit task global_range < MAX_INT
     // test cases for 2D im2col with large input W and H (occurs in stable-diffusion)
@@ -5005,10 +5073,41 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
-    // Direct CONV_2D
-    test_cases.emplace_back(new test_conv_2d({19, 19, 256, 16}, {4, 4, 256, 4096}, 1, 1, 0, 0, 1, 1, false, true));
-    // Indirect CONV_2D (uses im2col + sgemm)
-    test_cases.emplace_back(new test_conv_2d({19, 19, 256, 16}, {4, 4, 256, 4096}, 1, 1, 0, 0, 1, 1, false, false));
+    uint32_t iwh_idx = 0;
+    uint32_t kwh_idx = 1;
+    uint32_t Cout_idx = 2;
+    uint32_t Cin_idx = 3;
+    uint32_t B_idx = 4;
+    std::vector<std::array<int, 5>> cases = {
+        //{IWH, KWH, Cout, Cin, B}
+        // K=CRS=NPQ=4096 conv2d matmul performance
+        {19, 4, 4096, 256, 16},
+        // K=128, CRS=128, NPQ=4096
+        {19, 4, 128, 8, 16},
+        // K=130, CRS=128, NPQ=4096
+        {19, 4, 130, 8, 16},
+        // Edge case: K x CRS is small
+        {19, 2, 4, 4, 16},
+        // A ConvNet's first layer
+        {224, 3, 8, 3, 1},
+        // A ConvNet's first layer with 2x2 convolution, and 1 channel
+        {224, 2, 8, 1, 1},
+        // A ConvNet's first layer with 2x2 convolution, and 1 channel, several images in the batch
+        {224, 2, 8, 1, 8},
+        // A middle layer of a ConvNet
+        {58, 3, 64, 32, 1},
+        // A middle layer of a ConvNet, several images in the batch
+        {58, 3, 64, 32, 8},
+        // A deep layer of a ConvNet, several images in the batch
+        {16, 3, 512, 128, 8},
+    };
+
+    for(auto act_case : cases){
+        // Direct CONV_2D
+        test_cases.emplace_back(new test_conv_2d({act_case[iwh_idx], act_case[iwh_idx], act_case[Cin_idx], act_case[B_idx]}, {act_case[kwh_idx], act_case[kwh_idx], act_case[Cin_idx], act_case[Cout_idx]}, 1, 1, 0, 0, 1, 1, false, true));
+        // Indirect CONV_2D (uses im2col + sgemm)
+        test_cases.emplace_back(new test_conv_2d({act_case[iwh_idx], act_case[iwh_idx], act_case[Cin_idx], act_case[B_idx]}, {act_case[kwh_idx], act_case[kwh_idx], act_case[Cin_idx], act_case[Cout_idx]}, 1, 1, 0, 0, 1, 1, false, false));
+    }
 
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1, 1, 1}, {1,   1, 1, 1}));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1, 1, 1}, {1, 512, 1, 1}));
