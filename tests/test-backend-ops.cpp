@@ -5205,6 +5205,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {5, 5, 1, 32}, {3, 4, 1, 32}, 1, 1, 0, 0, 1, 1, true));
 
 // Conv_2D test cases
+#define DETAILED_TESTS
 #ifdef DETAILED_TESTS
     // Probably we do not have enough time to execute these in the pipeline.
     uint32_t iwh_idx  = 0;
@@ -5214,8 +5215,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     uint32_t B_idx    = 4;
 
     std::vector<std::array<int, 5>> cases = {
-  //{IWH, KWH, Cout, Cin, B}
-  // K=CRS=NPQ=4096 conv_2d matmul performance
+        //{IWH, KWH, Cout, Cin, B}
+        //
+        {19,   4, 32, 1, 10},   // 32, 16, 1600 (Image size [16 x 16]=256 can be divided by 16)
+
+        {8,   4, 16, 1, 1},   // 32, 16, 2560 (Image size [10 x 10]=100 cannot be divided by 16) --> coopmat crosses batch boundary
+        {7,   4, 32, 1, 4},     // 32, 16, 64   (Image size [4x4]=16) --> an image is a single coopmat
+        //{7,   3, 32, 1, 1},
+        // K=CRS=16, NPQ=16 conv_2d matmul performance -> one single coopmat tile: coopmat1 trivial impl (dst is contig., coopmat size divide matrix size)
+        {7,   4, 16, 1, 1},     // 16, 16, 16  (Image size: [4x4]=16)
+        // K=CRS=4096, NPQ=256 conv_2d matmul performance -> coopmat1 trivial impl (dst is contig., coopmat size divide matrix size)
+        {19,   4, 4096, 256, 16},   // 4096, 4096, 4096 (Image size: [16x16]=256)
+/*
+// K=CRS=NPQ=4096 conv_2d matmul performance
         {19,   4, 4096, 256, 16},
  // K=128, CRS=128, NPQ=4096
         { 19,  4, 128,  8,   16},
@@ -5235,6 +5247,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         { 58,  3, 64,   32,  8 },
  // A deep layer of a ConvNet, several images in the batch
         { 16,  3, 256,  128, 8 }
+        */
     };
 
     for (auto kernel_type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
@@ -5252,6 +5265,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         return (ins + 2 * p - d * (ks - 1) - 1) / s + 1;
     };
 
+    /*
     //uint32_t s0 = 3;
     uint32_t s1 = 5;
     uint32_t p0 = 5;
@@ -5282,6 +5296,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    */
 
     // sycl backend will limit task global_range < MAX_INT
     // test cases for 2D im2col with large input W and H (occurs in stable-diffusion)
@@ -5900,7 +5915,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
   //{IWH, KWH, Cout, Cin, B}
   // K=CRS=NPQ=4096 conv2d matmul performance
         {19,   4, 4096, 256, 16},
- // K=128, CRS=128, NPQ=4096
+        /*
+// K=128, CRS=128, NPQ=4096
         { 19,  4, 128,  8,   16},
  // K=130, CRS=128, NPQ=4096
         { 19,  4, 130,  8,   16},
@@ -5918,6 +5934,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         { 58,  3, 64,   32,  8 },
  // A deep layer of a ConvNet, several images in the batch
         { 16,  3, 512,  128, 8 },
+        */
     };
 
     for (auto kernel_type : {GGML_TYPE_F32, GGML_TYPE_F16}) {

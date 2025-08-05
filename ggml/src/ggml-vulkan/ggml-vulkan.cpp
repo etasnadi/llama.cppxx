@@ -23,6 +23,7 @@
 #include <mutex>
 #include <future>
 #include <thread>
+#include <fstream>
 
 #if defined(_MSC_VER)
 # define NOMINMAX 1
@@ -95,10 +96,45 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
     } while (0)
 
 #ifdef GGML_VULKAN_DEBUG
-#define VK_LOG_DEBUG(msg) std::cerr << msg << std::endl
+//#define VK_LOG_DEBUG(msg) std::cerr << msg << std::endl
+#define VK_LOG_DEBUG(msg) ((void) 0)
 #else
 #define VK_LOG_DEBUG(msg) ((void) 0)
 #endif // GGML_VULKAN_DEBUG
+
+std::vector<char> readFile(const char* filename) {
+    size_t len;
+    std::vector<char> buffer;
+
+    std::ifstream file(filename, std::ios::binary);
+    if (!file) {
+        std::cerr << "Error opening file: " << filename << '\n';
+        len = 0;
+        return buffer;  // empty vector
+    }
+
+    // Get file size
+    file.seekg(0, std::ios::end);
+    len = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    if (len == 0) {
+        return buffer;  // empty file
+    }
+
+    // Resize vector to fit file content
+    buffer.resize(len);
+
+    // Read file data into vector
+    if (!file.read(buffer.data(), len)) {
+        std::cerr << "Error reading file: " << filename << '\n';
+        buffer.clear();
+        len = 0;
+    }
+
+    return buffer;
+}
+
 
 struct ggml_backend_vk_context;
 
@@ -3096,7 +3132,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         uint32_t conv2d_SHMEM_PAD = 4;
         bool conv2d_UNROLL = true;
 
-        if (device->coopmat2) {
+        if (device->coopmat2 || device->coopmat_support) {
             conv2d_SHMEM_PAD = 8; // 8 float16_t
         }
 
@@ -3159,13 +3195,28 @@ static void ggml_vk_load_shaders(vk_device& device) {
         std::vector<uint32_t> spec_constants = { conv2d_WG_SIZE, conv2d_BS_K, conv2d_BS_CRS, conv2d_BS_NPQ, conv2d_TS_K, use_collectives, conv2d_SHMEM_PAD };
 
         if (device->coopmat2) {
-            ggml_vk_create_pipeline(
+	        ggml_vk_create_pipeline(
                 device, device->pipeline_conv2d_f32[s], "conv2d_f32", conv2d_f32_cm2_len, conv2d_f32_cm2_data, "main", 3,
                 sizeof(vk_op_conv2d_push_constants), wg_denoms, spec_constants, 1, true, use_collectives);
             ggml_vk_create_pipeline(
                 device, device->pipeline_conv2d_f16_f32[s], "conv2d_f16_f32", conv2d_f16_f32_cm2_len, conv2d_f16_f32_cm2_data, "main", 3,
                 sizeof(vk_op_conv2d_push_constants), wg_denoms, spec_constants, 1, true, use_collectives);
-        } else if (conv2d_UNROLL) {
+	    } else if (device->coopmat_support) {
+            std::string spv_dir = std::string("ggml/src/ggml-vulkan/vulkan-shaders.spv/");
+
+            std::string fname_f32 = spv_dir + "conv2d_f32_cm1.spv";
+            static std::vector<char> buff_f32 = readFile(fname_f32.c_str());
+
+            std::string fname_f32_f16 = spv_dir + "conv2d_f16_f32_cm1.spv";
+            static std::vector<char> buff_f32_f16 = readFile(fname_f32_f16.c_str());
+
+            ggml_vk_create_pipeline(
+                device, device->pipeline_conv2d_f32[s], "conv2d_f32", buff_f32.size(), buff_f32.data(), "main", 3,
+                sizeof(vk_op_conv2d_push_constants), wg_denoms, spec_constants, 1, true, use_collectives);
+            ggml_vk_create_pipeline(
+                device, device->pipeline_conv2d_f16_f32[s], "conv2d_f16_f32", buff_f32_f16.size(), buff_f32_f16.data(), "main", 3,
+                sizeof(vk_op_conv2d_push_constants), wg_denoms, spec_constants, 1, true, use_collectives);
+	    } else if (conv2d_UNROLL) {
             ggml_vk_create_pipeline(
                 device, device->pipeline_conv2d_f32[s], "conv2d_f32", conv2d_f32_unroll_len, conv2d_f32_unroll_data, "main", 3,
                 sizeof(vk_op_conv2d_push_constants), wg_denoms, spec_constants, 1, true, use_collectives);
@@ -4619,6 +4670,7 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     const uint32_t wg0 = CEIL_DIV(elements[0], pipeline->wg_denoms[0]);
     const uint32_t wg1 = CEIL_DIV(elements[1], pipeline->wg_denoms[1]);
     const uint32_t wg2 = CEIL_DIV(elements[2], pipeline->wg_denoms[2]);
+
     VK_LOG_DEBUG("ggml_vk_dispatch_pipeline(" << pipeline->name << ", {";
     for (auto& buffer : descriptor_buffer_infos) {
         std::cerr << "(" << buffer.buffer << ", " << buffer.offset << ", " << buffer.range << "), ";
@@ -7138,7 +7190,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             } else if (elements[0] <= 32 && tiles[CONV_SHAPE_32x256] >= shader_core_count * 2) {
                 shape = CONV_SHAPE_32x256;
             } else {
-                shape = CONV_SHAPE_64x32;
+                // TODO: restore before commit!
+                //shape = CONV_SHAPE_64x32;
+                shape = CONV_SHAPE_128x128;
             }
 
             if (src0->type == GGML_TYPE_F32) {
