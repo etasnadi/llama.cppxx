@@ -220,6 +220,7 @@ uint32_t pp(uint32_t x){
 }
 
 void main() {
+#ifdef DEBUG
     if(debug_thread){
         debugPrintfEXT("--> Input size: [K: %d, CRS: %d, NPQ: %d]\n", K, CRS, NPQ);
         debugPrintfEXT("--> Blocktile size: [BS_K: %d, BS_CRS: %d, BS_NPQ: %d]\n", BS_K, BS_CRS, BS_NPQ);
@@ -235,6 +236,7 @@ void main() {
 #endif
     }
     barrier();
+#endif
 
 #if defined(COOPMAT)
     coopmat<ACC_TYPE, gl_ScopeSubgroup, CMS_K, CMS_NPQ, gl_MatrixUseAccumulator> matC[NCMW_K][NCMW_NPQ];
@@ -407,6 +409,7 @@ void main() {
             }
         }
 #endif
+        barrier();
     }
     /* Save C* */
 #if defined(COOPMAT)
