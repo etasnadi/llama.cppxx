@@ -194,8 +194,8 @@ const uint32_t NCMB_CRS = BS_CRS / CMS_CRS;
 
 // Number of coopmats per warptile (K/NPQ dim)
 // TODO: These should be computed from BS_K/BS_NPQ instead of dfining them directly
-const uint32_t NCMW_K = 4;
-const uint32_t NCMW_NPQ = 2;
+const uint32_t NCMW_K = 2;
+const uint32_t NCMW_NPQ = 4;
 
 // Warptile size (K/NPQ dim)
 const uint32_t WTS_K = CMS_K * NCMW_K;          // 16*2 = 32
@@ -355,23 +355,22 @@ void main() {
         }
         barrier();
 #if defined(COOPMAT)
-         for(uint32_t CM_idx_CRS = 0; CM_idx_CRS < NCMB_CRS; CM_idx_CRS++){
+        [[unroll]]
+        for(uint32_t CM_idx_CRS = 0; CM_idx_CRS < NCMB_CRS; CM_idx_CRS++){
             uint32_t CRS_lidx = CM_idx_CRS*CMS_CRS;
 
+            [[unroll]]
             for(uint32_t CM_idx_K = 0; CM_idx_K < NCMW_K; CM_idx_K++){
                 uint32_t K_lidx = WT_idx_K * WTS_K + CM_idx_K * CMS_K;
-
-                if(K_lidx >= K){ continue; }
 
                 coopmat<float16_t, gl_ScopeSubgroup, CMS_K, CMS_CRS, gl_MatrixUseA> matA;
                 coopMatLoad(matA, Ash,
                     K_lidx * Ash_stride + CRS_lidx, Ash_stride,
                     gl_CooperativeMatrixLayoutRowMajor);
 
+                [[unroll]]
                 for(uint32_t CM_idx_NPQ = 0; CM_idx_NPQ < NCMW_NPQ; CM_idx_NPQ++){
                     uint32_t NPQ_lidx = WT_idx_NPQ * WTS_NPQ + CM_idx_NPQ * CMS_NPQ;
-
-                    if(NPQ_lidx >= NPQ){ continue; }
 
                     coopmat<float16_t, gl_ScopeSubgroup, CMS_CRS, CMS_NPQ, gl_MatrixUseB> matB;
                     coopMatLoad(matB, Bsh,
@@ -408,27 +407,23 @@ void main() {
             }
         }
 #endif
-        barrier();
     }
     /* Save C* */
 #if defined(COOPMAT)
+    [[unroll]]
     for(uint32_t CM_idx_K = 0; CM_idx_K < NCMW_K; CM_idx_K++){
-        uint32_t K_idx = B_idx_K * BS_K + WT_idx_K * WTS_K + CM_idx_K * CMS_K;
-        if(K_idx >= K){ continue; }
-
+        [[unroll]]
         for(uint32_t CM_idx_NPQ = 0; CM_idx_NPQ < NCMW_NPQ; CM_idx_NPQ++){
+            uint32_t K_idx = B_idx_K * BS_K + WT_idx_K * WTS_K + CM_idx_K * CMS_K;
             uint32_t NPQ_idx = B_idx_NPQ * BS_NPQ + WT_idx_NPQ * WTS_NPQ + CM_idx_NPQ * CMS_NPQ;
-
-            if(NPQ_idx >= NPQ || K_idx >= K){continue; }
-
             uint32_t N_idx   = fastdiv(NPQ_idx, p.OWOHmp, p.OWOHL); // divide by p.OH * p.OW;
             uint32_t OH_idx  = fastdiv(NPQ_idx - N_idx * p.OH * p.OW, p.OWmp, p.OWL); // divide by p.OW;
             uint32_t OW_idx  = NPQ_idx - N_idx * p.OH * p.OW - OH_idx * p.OW;
             uint32_t dst_idx = OW_idx + OH_idx * p.nb1 + K_idx * p.nb2 + N_idx * p.nb3;
-
-            coopmat<float, gl_ScopeSubgroup, CMS_K, CMS_NPQ, gl_MatrixUseAccumulator> matC_dst = coopmat<float, gl_ScopeSubgroup, CMS_K, CMS_NPQ, gl_MatrixUseAccumulator>(matC[CM_idx_K][CM_idx_NPQ]);
-
-            coopMatStore(matC_dst, dst_data, dst_idx, p.OW*p.OH, gl_CooperativeMatrixLayoutRowMajor);
+            if(K_idx < K && NPQ_idx < NPQ){
+                coopmat<float, gl_ScopeSubgroup, CMS_K, CMS_NPQ, gl_MatrixUseAccumulator> matC_dst = coopmat<float, gl_ScopeSubgroup, CMS_K, CMS_NPQ, gl_MatrixUseAccumulator>(matC[CM_idx_K][CM_idx_NPQ]);
+                coopMatStore(matC_dst, dst_data, dst_idx, p.OW*p.OH, gl_CooperativeMatrixLayoutRowMajor);
+            }
         }
     }
 #elif defined(COOPMAT2)
