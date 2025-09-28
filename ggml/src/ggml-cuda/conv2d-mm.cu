@@ -129,7 +129,7 @@ __global__ void __launch_bounds__(WG_SIZE, 1) mm(uint          K,
 #ifdef USE_COLLECTIVES
         const int laneId = threadIdx.x & 0x1f;
         // Each thread in CRS dim computes a result that will be broadcast among them
-        assert(CRS <= warpSize);
+        assert(BS_CRS <= warpSize);
         const uint32_t cached_CRS_idx = idx_CRS + laneId;
         const uint32_t cached_Cin_idx = cached_CRS_idx / (dp.KW * dp.KH);
         uint32_t       rem            = (cached_CRS_idx - cached_Cin_idx * dp.KW * dp.KH);
