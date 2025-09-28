@@ -5899,6 +5899,58 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 #endif
 
+    // Stable-diffusion layers
+    std::map<std::string, uint32_t> idx_sd{
+        { "iw",   0 },
+        { "ih",   1 },
+        { "kw",   2 },
+        { "kh",   3 },
+        { "Cout", 4 },
+        { "Cin",  5 },
+        { "B",    6 },
+    };
+
+    // Input image size
+    uint32_t w = 768;
+    uint32_t h = 1024;
+
+    // Number of filters (base)
+    uint32_t Cout_b = 128;
+    uint32_t Cin_b  = 128;
+
+    std::vector<std::array<uint32_t, 7>> cases_sd = {
+        { w / 8, h / 8, 3, 3, Cout_b * 4, Cin_b * 4, 1 }, // x10 (called 10 times)
+        { w / 4, h / 4, 3, 3, Cout_b * 4, Cin_b * 4, 1 }, // x7
+        { w / 2, h / 2, 3, 3, Cout_b * 2, Cin_b * 2, 1 }, // x5
+        { w,     h,     3, 3, Cout_b,     Cin_b,     1 }, // x5
+        { w / 8, h / 8, 1, 1, Cout_b * 4, Cin_b * 4, 1 }, // x4
+        { w / 8, h / 8, 1, 1, 4,          4,         1 },
+        { w / 8, h / 8, 3, 3, Cout_b * 4, 4,         1 },
+
+        { w / 2, h / 2, 3, 3, Cout_b * 4, Cin_b * 4, 1 },
+        { w / 2, h / 2, 3, 3, Cout_b * 2, Cin_b * 4, 1 },
+        { w / 2, h / 2, 1, 1, Cout_b * 2, Cin_b * 4, 1 },
+
+        { w,     h,     3, 3, Cout_b,     Cin_b * 2, 1 },
+        { w,     h,     1, 1, Cout_b,     Cin_b * 2, 1 },
+        { w,     h,     3, 3, Cout_b * 2, Cin_b * 2, 1 },
+
+        { w,     h,     3, 3, 3,          Cin_b,     1 },
+    };
+
+    for (auto act_case : cases_sd) {
+        GGML_ASSERT(act_case[idx_sd["kw"]] == 3 || act_case[idx_sd["kw"]] == 1);
+        GGML_ASSERT(act_case[idx_sd["kh"]] == 3 || act_case[idx_sd["kh"]] == 1);
+
+        uint32_t p0 = act_case[idx_sd["kw"]] == 3 ? 1 : 0;
+        uint32_t p1 = act_case[idx_sd["kh"]] == 3 ? 1 : 0;
+
+        test_cases.emplace_back(new test_conv_2d(
+            { act_case[idx_sd["iw"]], act_case[idx_sd["ih"]], act_case[idx_sd["Cin"]], act_case[idx_sd["B"]] },
+            { act_case[idx_sd["kw"]], act_case[idx_sd["kh"]], act_case[idx_sd["Cin"]], act_case[idx_sd["Cout"]] },
+            GGML_TYPE_F16, 1, 1, p0, p1, 1, 1, false));
+    }
+
     // CONV_2D:
     auto calc_conv_output_size = [](int64_t ins, int64_t ks, int s, int p, int d) -> int64_t {
         return (ins + 2 * p - d * (ks - 1) - 1) / s + 1;
@@ -6735,6 +6787,57 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Stable-diffusion layers
+    std::map<std::string, uint32_t> idx_sd{
+        { "iw",   0 },
+        { "ih",   1 },
+        { "kw",   2 },
+        { "kh",   3 },
+        { "Cout", 4 },
+        { "Cin",  5 },
+        { "B",    6 },
+    };
+
+    // Input image size
+    uint32_t w = 768;
+    uint32_t h = 1024;
+
+    // Number of filters (base)
+    uint32_t Cout_b = 128;
+    uint32_t Cin_b  = 128;
+
+    std::vector<std::array<uint32_t, 7>> cases_sd = {
+        { w / 8, h / 8, 3, 3, Cout_b * 4, Cin_b * 4, 1 }, // x10 (called 10 times)
+        { w / 4, h / 4, 3, 3, Cout_b * 4, Cin_b * 4, 1 }, // x7
+        { w / 2, h / 2, 3, 3, Cout_b * 2, Cin_b * 2, 1 }, // x5
+        { w,     h,     3, 3, Cout_b,     Cin_b,     1 }, // x5
+        { w / 8, h / 8, 1, 1, Cout_b * 4, Cin_b * 4, 1 }, // x4
+        { w / 8, h / 8, 1, 1, 4,          4,         1 },
+        { w / 8, h / 8, 3, 3, Cout_b * 4, 4,         1 },
+
+        { w / 2, h / 2, 3, 3, Cout_b * 4, Cin_b * 4, 1 },
+        { w / 2, h / 2, 3, 3, Cout_b * 2, Cin_b * 4, 1 },
+        { w / 2, h / 2, 1, 1, Cout_b * 2, Cin_b * 4, 1 },
+
+        { w,     h,     3, 3, Cout_b,     Cin_b * 2, 1 },
+        { w,     h,     1, 1, Cout_b,     Cin_b * 2, 1 },
+        { w,     h,     3, 3, Cout_b * 2, Cin_b * 2, 1 },
+
+        { w,     h,     3, 3, 3,          Cin_b,     1 },
+    };
+
+    for (auto act_case : cases_sd) {
+        GGML_ASSERT(act_case[idx_sd["kw"]] == 3 || act_case[idx_sd["kw"]] == 1);
+        GGML_ASSERT(act_case[idx_sd["kh"]] == 3 || act_case[idx_sd["kh"]] == 1);
+
+        uint32_t p0 = act_case[idx_sd["kw"]] == 3 ? 1 : 0;
+        uint32_t p1 = act_case[idx_sd["kh"]] == 3 ? 1 : 0;
+
+        test_cases.emplace_back(new test_conv_2d(
+            { act_case[idx_sd["iw"]], act_case[idx_sd["ih"]], act_case[idx_sd["Cin"]], act_case[idx_sd["B"]] },
+            { act_case[idx_sd["kw"]], act_case[idx_sd["kh"]], act_case[idx_sd["Cin"]], act_case[idx_sd["Cout"]] },
+            GGML_TYPE_F16, 1, 1, p0, p1, 1, 1, false));
+    }
 
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1, 1, 1}, {1,   1, 1, 1}));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1, 1, 1}, {1, 512, 1, 1}));

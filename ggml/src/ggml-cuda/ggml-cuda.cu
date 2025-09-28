@@ -14,6 +14,7 @@
 #include "ggml-cuda/conv-transpose-1d.cuh"
 #include "ggml-cuda/conv2d.cuh"
 #include "ggml-cuda/conv2d-implicit.cuh"
+#include "ggml-cuda/conv2d-mm.cuh"
 #include "ggml-cuda/conv2d-dw.cuh"
 #include "ggml-cuda/conv2d-transpose.cuh"
 #include "ggml-cuda/convert.cuh"
@@ -2462,7 +2463,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_im2col_3d(ctx, dst);
             break;
         case GGML_OP_CONV_2D:
-            ggml_cuda_op_conv2d(ctx, dst);
+            if(getenv("GGML_CUDA_USE_IMPLICIT_CONV")){
+                ggml_cuda_op_conv2d_implicit(ctx, dst);
+            }else if(getenv("GGML_CUDA_USE_DIRECT_CONV")){
+                ggml_cuda_op_conv2d_mm(ctx, dst);
+            }else{
+                ggml_cuda_op_conv2d(ctx, dst);
+            }
             break;
         case GGML_OP_CONV_2D_IMPLICIT:
             ggml_cuda_op_conv2d_implicit(ctx, dst);
@@ -3044,7 +3051,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_AMPERE) {
             cuda_ctx->cuda_graph->disable_due_to_gpu_arch = true;
 #ifndef NDEBUG
-            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
+            //GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
 #endif
         }
     }
