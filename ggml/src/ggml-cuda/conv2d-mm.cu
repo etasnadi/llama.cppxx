@@ -204,9 +204,7 @@ __global__ void __launch_bounds__(WG_SIZE, 1) mm(uint          K,
         __syncthreads();
 		
         for (uint32_t CRS_lidx = 0; CRS_lidx < BS_CRS; ++CRS_lidx) {
-            #pragma unroll
             for(uint32_t MMA_y = 0; MMA_y < NMMA_K; MMA_y++){
-                #pragma unroll
                 for(uint32_t T_ly = 0; T_ly < TS_K; T_ly++){
                     //Load Ash to regA
                     uint32_t A_ly = (W_y * WS_K) + (MMA_y * MMAS_K) + (T_y * TS_K) + T_ly;
@@ -214,9 +212,7 @@ __global__ void __launch_bounds__(WG_SIZE, 1) mm(uint          K,
                 }
             }
             
-            #pragma unroll
             for(uint32_t MMA_x = 0; MMA_x < NMMA_NPQ; MMA_x++){
-                #pragma unroll
                 for(uint32_t T_lx = 0; T_lx < TS_NPQ; T_lx++){
                     // Load Bsh to regB
                     uint32_t B_lx = (W_x * WS_NPQ) + (MMA_x * MMAS_NPQ) + (T_x * TS_NPQ) + T_lx;
@@ -224,13 +220,9 @@ __global__ void __launch_bounds__(WG_SIZE, 1) mm(uint          K,
                 }
             }
             
-            #pragma unroll
             for(uint32_t MMA_y = 0; MMA_y < NMMA_K; MMA_y++){
-                #pragma unroll
                 for(uint32_t MMA_x = 0; MMA_x < NMMA_NPQ; MMA_x++){
-                    #pragma unroll
                     for(uint32_t T_ly = 0; T_ly < TS_K; T_ly++){
-                        #pragma unroll
                         for(uint32_t T_lx = 0; T_lx < TS_NPQ; T_lx++){
                             regC[MMA_y * NMMA_NPQ + MMA_x][T_ly * TS_NPQ + T_lx] = fmaf(
                                 regA[MMA_y][T_ly], 
@@ -245,6 +237,7 @@ __global__ void __launch_bounds__(WG_SIZE, 1) mm(uint          K,
     }
 
     /* Save C* */
+    #pragma unroll
     for(uint32_t MMA_y = 0; MMA_y < NMMA_K; MMA_y++){
         for(uint32_t MMA_x = 0; MMA_x < NMMA_NPQ; MMA_x++){
             for (uint32_t T_ly = 0; T_ly < TS_K; T_ly++) {
