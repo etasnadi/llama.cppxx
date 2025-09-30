@@ -5897,7 +5897,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 kernel_type, 1, 1, 0, 0, 1, 1, false));
         }
     }
-#endif
 
     // Stable-diffusion layers
     std::map<std::string, uint32_t> idx_sd{
@@ -5950,6 +5949,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             { act_case[idx_sd["kw"]], act_case[idx_sd["kh"]], act_case[idx_sd["Cin"]], act_case[idx_sd["Cout"]] },
             GGML_TYPE_F16, 1, 1, p0, p1, 1, 1, false));
     }
+#endif
 
     // CONV_2D:
     auto calc_conv_output_size = [](int64_t ins, int64_t ks, int s, int p, int d) -> int64_t {

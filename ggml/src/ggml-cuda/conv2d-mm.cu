@@ -3,14 +3,10 @@
 
 #include <cuda_runtime.h>
 
-// If defined, indices are computed once and re-used by each thread
+// If defined, indices are computed once and re-used by each thread.
 #if __CUDA_ARCH__ < 700
 #    define USE_COLLECTIVES
 #endif
-
-//#define A_TRANS       // Transposes the A matrix in shmem
-//#define A_OPT         // Optimizes A for reducing bank conflicts
-#define B_OPT  // Optimizes B for reducing bank conflicts
 
 #define CEIL_DIV(M, N) (((M) + (N) - 1) / (N))
 
@@ -63,7 +59,7 @@ __align__(16) struct Params {
 __constant__ __device__ Params dp;
 
 // --> conv_2d kernel modified to function as a matmul
-template <typename T, uint BS_K, uint BS_NPQ, uint BS_CRS, uint TS_K, uint TS_NPQ, uint WG_SIZE, uint VEC_SIZE>
+template <typename T, uint BS_K, uint BS_NPQ, uint BS_CRS, uint WS_K, uint WS_NPQ, uint MMAS_K, uint MMAS_NPQ, uint TS_K, uint TS_NPQ, uint WG_SIZE>
 __global__ void __launch_bounds__(WG_SIZE, 1) mm(uint          K,
                                                  uint          NPQ,
                                                  uint          CRS,
@@ -88,25 +84,12 @@ __global__ void __launch_bounds__(WG_SIZE, 1) mm(uint          K,
         */
     }
 
-    // T_y, T_x: the tile position this thread is resposible for computing.
-    assert(BS_NPQ % TS_NPQ == 0);
-    assert(TS_NPQ <= BS_NPQ);
-    const uint NT_x = BS_NPQ / TS_NPQ;
-    assert(BS_K % TS_K == 0);
-    assert(TS_K <= BS_K);
-    // const uint NT_y = BS_K / TS_K; // unused
-
     // Ensure that the kernel is properly called
-    // 1. each thread processes a threadtile of size TS_K*TS_NPQ, that is exactly the WG_SIZE
-    assert((BS_K / TS_K) * (BS_NPQ / TS_NPQ) == WG_SIZE);
-    // 2. the number of threads is exactly the WG_SIZE
     assert(blockDim.x == WG_SIZE && blockDim.y == 1 && blockDim.z == 1);
 
-    const uint T_y = threadIdx.x / NT_x;
-    const uint T_x = threadIdx.x % NT_x;
-
     // __shared__ float Ash[BS_K * BS_CRS];
-    __shared__ T Ash[BS_K * BS_CRS];
+    const uint32_t Ash_stride = BS_CRS+1;
+    __shared__ T Ash[BS_K * Ash_stride];
     __shared__ float Bsh[BS_CRS * BS_NPQ];
 
     const uint Ar = threadIdx.x / BS_CRS;
@@ -119,17 +102,31 @@ __global__ void __launch_bounds__(WG_SIZE, 1) mm(uint          K,
     assert(WG_SIZE >= BS_NPQ);
     const uint BrpWg = WG_SIZE / BS_NPQ;
 
-    float regA[TS_K]          = { 0.0 };
-    float regB[TS_NPQ]        = { 0.0 };
-    float regC[TS_K * TS_NPQ] = { 0.0 };
+    // Warptile coordinate in the blocktile
+    uint32_t warpId = threadIdx.x / 32;
+    const int laneId = threadIdx.x & 0x1f;
+    uint32_t W_y = warpId / (BS_NPQ / WS_NPQ);
+    uint32_t W_x = warpId % (BS_NPQ / WS_NPQ);
+
+	// Number of MMA tiles in the warptile
+	const uint NMMA_K = WS_K / MMAS_K;
+	const uint NMMA_NPQ = WS_NPQ / MMAS_NPQ;
+
+	// The warp has NMMA_K * NMMA_NPQ MMA tile in registers.
+    float regA[NMMA_K][TS_K]          = { 0.0 };
+    float regB[NMMA_NPQ][TS_NPQ]        = { 0.0 };
+    float regC[NMMA_K*NMMA_NPQ][TS_K*TS_NPQ] = { 0.0 };
+
+	// Thread coordinate in the MMA tile
+    const uint T_y = laneId / (MMAS_NPQ / TS_NPQ);
+    const uint T_x = laneId % (MMAS_NPQ / TS_NPQ);
 
     /* Advance block in CRS dim */
     for (uint idx_CRS = 0; idx_CRS < CRS; idx_CRS += BS_CRS) {
 /* Load kernel to A_block: (BS_K x BS_CRS)*/
 #ifdef USE_COLLECTIVES
-        const int laneId = threadIdx.x & 0x1f;
         // Each thread in CRS dim computes a result that will be broadcast among them
-        assert(CRS <= warpSize);
+        assert(BS_CRS <= warpSize);
         const uint32_t cached_CRS_idx = idx_CRS + laneId;
         const uint32_t cached_Cin_idx = cached_CRS_idx / (dp.KW * dp.KH);
         uint32_t       rem            = (cached_CRS_idx - cached_Cin_idx * dp.KW * dp.KH);
@@ -160,20 +157,7 @@ __global__ void __launch_bounds__(WG_SIZE, 1) mm(uint          K,
             if (CRS_idx_a >= CRS || K_idx_a >= K) {
                 val = (T)0.0;
             }
-
-#ifdef A_TRANS
-#    ifdef A_OPT
-            uint32_t T_id        = (r_offset + Ar) / TS_K;                      // E.g.: 41/16 = 2
-            uint32_t vec_in_TT   = ((r_offset + Ar) - T_id * TS_K) / VEC_SIZE;  // E.g.: 41-2*16 =     9 -> 9/4 = 2
-            uint32_t elem_in_vec = ((r_offset + Ar) - T_id * TS_K) % VEC_SIZE;  // E.g.:               9 -> 9%4 = 1
-            uint32_t col_offset  = vec_in_TT * (NT_y * VEC_SIZE) + T_id * VEC_SIZE + elem_in_vec;
-#    else
-            uint32_t col_offset = (r_offset + Ar);
-#    endif
-            Ash[Ac * BS_K + col_offset] = val;
-#else
-            Ash[(r_offset + Ar) * BS_CRS + Ac] = val;
-#endif
+            Ash[(r_offset + Ar) * Ash_stride + Ac] = val;
         }
 
 #pragma unroll
@@ -214,54 +198,45 @@ __global__ void __launch_bounds__(WG_SIZE, 1) mm(uint          K,
             } else {
                 val = src_data[src_idx];
             }
-
-#ifdef B_OPT
-            assert(VEC_SIZE <= TS_NPQ);
-            const uint32_t T_id        = Bc / TS_NPQ;                      // E.g.: 41/16 = 2
-            const uint32_t vec_in_TT   = (Bc - T_id * TS_NPQ) / VEC_SIZE;  // E.g.: 41-2*16 =     9 -> 9/4 = 2
-            const uint32_t elem_in_vec = (Bc - T_id * TS_NPQ) % VEC_SIZE;  // E.g.:               9 -> 9%4 = 1
-            const uint32_t col_offset  = vec_in_TT * (NT_x * VEC_SIZE) + T_id * VEC_SIZE + elem_in_vec;
-#else
-            uint32_t col_offset = Bc;
-#endif
-            Bsh[(r_offset + Br) * BS_NPQ + col_offset] = val;
+            Bsh[(r_offset + Br) * BS_NPQ + Bc] = val;
         }
 
         __syncthreads();
-
-        if (T_y * TS_K < K) {
-#pragma unroll
-            for (uint32_t CRS_lidx = 0; CRS_lidx < BS_CRS; ++CRS_lidx) {
-#pragma unroll
-                for (uint32_t T_ly = 0; T_ly < TS_K; ++T_ly) {
-#ifdef A_TRANS
-#    ifdef A_OPT
-                    uint32_t T_id        = T_y;
-                    uint32_t vec_in_TT   = T_ly / VEC_SIZE;
-                    uint32_t elem_in_vec = T_ly % VEC_SIZE;
-                    uint32_t col_offset  = vec_in_TT * (NT_y * VEC_SIZE) + T_id * VEC_SIZE + elem_in_vec;
-#    else
-                    uint32_t col_offset = (T_y * TS_K + T_ly);
-#    endif
-                    regA[T_ly] = ggml_cuda_cast<float>(Ash[CRS_lidx * BS_K + col_offset]);
-#else
-                    regA[T_ly] = ggml_cuda_cast<float>(Ash[(T_y * TS_K + T_ly) * BS_CRS + CRS_lidx]);
-#endif
+		
+        for (uint32_t CRS_lidx = 0; CRS_lidx < BS_CRS; ++CRS_lidx) {
+            #pragma unroll
+            for(uint32_t MMA_y = 0; MMA_y < NMMA_K; MMA_y++){
+                #pragma unroll
+                for(uint32_t T_ly = 0; T_ly < TS_K; T_ly++){
+                    //Load Ash to regA
+                    uint32_t A_ly = (W_y * WS_K) + (MMA_y * MMAS_K) + (T_y * TS_K) + T_ly;
+                    regA[MMA_y][T_ly] = ggml_cuda_cast<float>(Ash[A_ly * Ash_stride + CRS_lidx]);
                 }
-                for (uint32_t T_lx = 0; T_lx < TS_NPQ; ++T_lx) {
-#ifdef B_OPT
-                    const uint32_t T_id        = T_x;
-                    const uint32_t vec_in_TT   = T_lx / VEC_SIZE;
-                    const uint32_t elem_in_vec = T_lx % VEC_SIZE;
-                    const uint32_t col_offset  = vec_in_TT * (NT_x * VEC_SIZE) + T_id * VEC_SIZE + elem_in_vec;
-#else
-                    const uint32_t col_offset = T_x * TS_NPQ + T_lx;
-#endif
-                    regB[T_lx] = Bsh[CRS_lidx * BS_NPQ + col_offset];
+            }
+            
+            #pragma unroll
+            for(uint32_t MMA_x = 0; MMA_x < NMMA_NPQ; MMA_x++){
+                #pragma unroll
+                for(uint32_t T_lx = 0; T_lx < TS_NPQ; T_lx++){
+                    // Load Bsh to regB
+                    uint32_t B_lx = (W_x * WS_NPQ) + (MMA_x * MMAS_NPQ) + (T_x * TS_NPQ) + T_lx;
+                    regB[MMA_x][T_lx] = ggml_cuda_cast<float>(Bsh[CRS_lidx * BS_NPQ + B_lx]);
                 }
-                for (uint32_t T_ly = 0; T_ly < TS_K; ++T_ly) {
-                    for (uint32_t T_lx = 0; T_lx < TS_NPQ; ++T_lx) {
-                        regC[T_ly * TS_NPQ + T_lx] = fmaf(regA[T_ly], regB[T_lx], regC[T_ly * TS_NPQ + T_lx]);
+            }
+            
+            #pragma unroll
+            for(uint32_t MMA_y = 0; MMA_y < NMMA_K; MMA_y++){
+                #pragma unroll
+                for(uint32_t MMA_x = 0; MMA_x < NMMA_NPQ; MMA_x++){
+                    #pragma unroll
+                    for(uint32_t T_ly = 0; T_ly < TS_K; T_ly++){
+                        #pragma unroll
+                        for(uint32_t T_lx = 0; T_lx < TS_NPQ; T_lx++){
+                            regC[MMA_y * NMMA_NPQ + MMA_x][T_ly * TS_NPQ + T_lx] = fmaf(
+                                regA[MMA_y][T_ly], 
+                                regB[MMA_x][T_lx],
+                                regC[MMA_y * NMMA_NPQ + MMA_x][T_ly * TS_NPQ + T_lx]);
+                        }
                     }
                 }
             }
@@ -270,32 +245,22 @@ __global__ void __launch_bounds__(WG_SIZE, 1) mm(uint          K,
     }
 
     /* Save C* */
-    for (uint32_t T_ly = 0; T_ly < TS_K; T_ly++) {
-        for (uint32_t T_lx = 0; T_lx < TS_NPQ; T_lx++) {
-            const uint32_t K_idx     = B_idx_K * BS_K + T_y * TS_K + T_ly;
-            const uint32_t NPQ_idx_c = B_idx_NPQ * BS_NPQ + T_x * TS_NPQ + T_lx;
-            //const uint32_t N_idx_c = NPQ_idx_c / (dp.OH*dp.OW);
-            const uint32_t N_idx_c   = fastdiv(NPQ_idx_c, dp.OWOH_fastdiv);  // divide by p.OH * p.OW;
-            //const uint32_t OH_idx_c = (NPQ_idx_c - N_idx_c*dp.OH*dp.OW) / dp.OW;
-            const uint32_t OH_idx_c = fastdiv(NPQ_idx_c - N_idx_c * dp.OH * dp.OW, dp.OW_fastdiv);  // divide by p.OW;
-            const uint32_t OW_idx_c = NPQ_idx_c - N_idx_c * dp.OH * dp.OW - OH_idx_c * dp.OW;
-            const uint32_t dst_idx  = OW_idx_c + OH_idx_c * dp.nb1 + K_idx * dp.nb2 + N_idx_c * dp.nb3;
-            if (K_idx < K && NPQ_idx_c < NPQ) {
-                /*
-                if(dst_idx >= K*NPQ){
-                    printf("Overindexing array %p  K_idx: %d/%d, Cout: %d,  NPQ_idx_c: %d/%d,  N_idx_c: %d/%d,  OH_idx_c: %d/%d,  OW_idx_c %d/%d\n nb1: %d, nb2: %d, nb3: %d; dst_idx: %d!\n", 
-                        dst_data, 
-                        K_idx, K, 
-                        dp.Cout, 
-                        NPQ_idx_c, NPQ, 
-                        N_idx_c, dp.N,
-                        OH_idx_c, dp.OH, 
-                        OW_idx_c, dp.OW,  
-                        dp.nb1, dp.nb2, dp.nb3, 
-                        dst_idx);
+    for(uint32_t MMA_y = 0; MMA_y < NMMA_K; MMA_y++){
+        for(uint32_t MMA_x = 0; MMA_x < NMMA_NPQ; MMA_x++){
+            for (uint32_t T_ly = 0; T_ly < TS_K; T_ly++) {
+                for (uint32_t T_lx = 0; T_lx < TS_NPQ; T_lx++) {
+                    const uint32_t K_idx     = (B_idx_K * BS_K) + (W_y * WS_K) + (MMA_y * MMAS_K) + (T_y * TS_K + T_ly);
+                    const uint32_t NPQ_idx_c = (B_idx_NPQ * BS_NPQ) + (W_x * WS_NPQ) + (MMA_x * MMAS_NPQ) + (T_x * TS_NPQ + T_lx);
+                    //const uint32_t N_idx_c = NPQ_idx_c / (dp.OH*dp.OW);
+                    const uint32_t N_idx_c   = fastdiv(NPQ_idx_c, dp.OWOH_fastdiv);  // divide by p.OH * p.OW;
+                    //const uint32_t OH_idx_c = (NPQ_idx_c - N_idx_c*dp.OH*dp.OW) / dp.OW;
+                    const uint32_t OH_idx_c = fastdiv(NPQ_idx_c - N_idx_c * dp.OH * dp.OW, dp.OW_fastdiv);  // divide by p.OW;
+                    const uint32_t OW_idx_c = NPQ_idx_c - N_idx_c * dp.OH * dp.OW - OH_idx_c * dp.OW;
+                    const uint32_t dst_idx  = OW_idx_c + OH_idx_c * dp.nb1 + K_idx * dp.nb2 + N_idx_c * dp.nb3;
+                    if (K_idx < K && NPQ_idx_c < NPQ) {
+                        dst_data[dst_idx] = regC[MMA_y * NMMA_NPQ + MMA_x][T_ly * TS_NPQ + T_lx];
+                    }
                 }
-                */
-                dst_data[dst_idx] = regC[T_ly * TS_NPQ + T_lx];
             }
         }
     }
@@ -324,22 +289,88 @@ void ggml_cuda_op_conv_2d_variant(ggml_backend_cuda_context & ctx,
                                   ggml_tensor *               src1,
                                   ggml_tensor *               dst,
                                   const Params &              p) {
-    // Tile size calculation options:
-    // Option 1: fix block size and all tile sizes except TS_NPQ as it is the free parameter (used in the Vulkan backend).
-    // Option 2: fix all tile sizes and block size is the free parameter.
-    const uint32_t WG_SIZE = 256;  // Option 1
+    
+	/*
+	Free parameters: WG_SIZE, BS_K, BS_NPQ
+	
+	WS_K * NW_K * WS_NPQ * NW_NPQ = BS_K * BS_NPQ
+	NW_K * NW_NPQ = WG_SIZE / warpSize = NW
+	Free parameter: NW_K determines WS_K and determines NW_NPQ which determines WS_NPQ
+	
+	MMAS_K * NMMA_K * MMAS_NPQ * NMMA_NPQ = WS_K * WS_NPQ
+	Free parameters: NMMA_K determines MMAS_K, NMMA_NPQ determines MMAS_NPQ
+	
+	TS_K * NT_K * TS_NPQ * NT_NPQ = MMAS_K * MMAS_NPQ
+	NT_K * NT_NPQ = warpSize
+	Free parameter: NT_K determines NT_NPQ and TS_K which determines TS_NPQ
+	
+	All parameters of the problem: 
+		* WG_SIZE, 
+		* BS_K, BS_NPQ, BS_CRS, 
+		* NW_K, 
+		* NMMA_K, NMMA_NPQ, 
+		* NT_K
+	*/
+	
+	const uint32_t WG_SIZE = 128;
+    const uint32_t BS_K   = 128; //conv_shapes[0][CONV_SHAPE];
+    const uint32_t BS_CRS = 16; //conv_shapes[1][CONV_SHAPE];
+    const uint32_t BS_NPQ = 128; //conv_shapes[2][CONV_SHAPE];
+	const uint32_t NW_K = 2;    // -> NW_NPQ=2
+	const uint32_t NMMA_K = 8;  //
+	const uint32_t NMMA_NPQ = 8;
+	const uint32_t NT_K = 4;
 
-    const uint32_t BS_K   = conv_shapes[0][CONV_SHAPE];
-    const uint32_t BS_CRS = conv_shapes[1][CONV_SHAPE];
-    const uint32_t BS_NPQ = conv_shapes[2][CONV_SHAPE];
-    const uint32_t TS_K   = conv_shapes[3][CONV_SHAPE];
-    //const uint32_t TS_NPQ = sh[4][CONV_SHAPE];			// Option 2
-    const uint32_t TS_NPQ = BS_K * BS_NPQ / WG_SIZE / TS_K;
+	// Calculating the remaining parameters for the kernel call
+	const uint32_t WS = 32; // TODO: query through ggml_cuda wrapper.
+	const uint32_t NW = WG_SIZE / WS;
 
-    // Some architectures can use 128-bit loads that might be more efficient.
-    const uint32_t VEC_SIZE = TS_NPQ >= 4 ? 4 : 1;
+    // Number of warptiles per blocktile
+    // const uint32_t NW_K
+	const uint32_t NW_NPQ = NW / NW_K;
 
-    //const uint32_t WG_SIZE = (BS_K*BS_NPQ) / (TS_K*TS_NPQ);		// Option 2
+    GGML_ASSERT(NW_K > 0);
+    GGML_ASSERT(BS_K % NW_K == 0);
+    GGML_ASSERT(NW_NPQ > 0);
+    GGML_ASSERT(BS_NPQ % NW_NPQ == 0);
+
+    // Warptile sizes (part of a blocktile computed by a single warp)
+    const uint32_t WS_K = BS_K / NW_K;
+    const uint32_t WS_NPQ = BS_NPQ / NW_NPQ;
+
+    GGML_ASSERT(WS_K > 0);
+    GGML_ASSERT(WS_NPQ > 0);
+
+    // Number of MMA tiles per warptile (part of a warptile computed by the warp iteratively)
+    // const uint32_t NMMA_K
+	// const uint32_t NMMA_NPQ
+	
+	GGML_ASSERT(NMMA_K > 0);
+    GGML_ASSERT(WS_K % NMMA_K == 0);
+    GGML_ASSERT(NMMA_NPQ > 0);
+    GGML_ASSERT(WS_NPQ % NMMA_NPQ == 0);
+
+    // MMA tile sizes
+    const uint32_t MMAS_K = WS_K / NMMA_K;
+    const uint32_t MMAS_NPQ = WS_NPQ / NMMA_NPQ;
+
+    GGML_ASSERT(MMAS_K > 0);
+    GGML_ASSERT(MMAS_NPQ > 0);
+
+	// const uint32_t NT_K
+	const uint32_t NT_NPQ = WS / NT_K;
+	
+	// Thread tile size
+	const uint32_t TS_K = MMAS_K / NT_K;
+	const uint32_t TS_NPQ = MMAS_NPQ / NT_NPQ;
+
+    /*
+    printf("Tile sizes:\n");
+    printf("BS_K=%d     BS_NPQ=%d   BS_CRS=%d\n", BS_K, BS_NPQ, BS_CRS);
+    printf("WS_K=%d     WS_NPQ=%d\n", WS_K, WS_NPQ);
+    printf("MMAS_K=%d   MMAS_NPQ=%d\n", MMAS_K, MMAS_NPQ);
+    printf("TS_K=%d     TS_NPQ=%d\n", TS_K, TS_NPQ);
+    */
 
     // Kernel runtime parameters
     int64_t  NPQ    = p.N * p.OW * p.OH;
@@ -359,11 +390,11 @@ void ggml_cuda_op_conv_2d_variant(ggml_backend_cuda_context & ctx,
     
     if(src0->type == GGML_TYPE_F16) {
         half *src0_data = (half *) src0->data;
-        mm<half, BS_K, BS_NPQ, BS_CRS, TS_K, TS_NPQ, WG_SIZE, VEC_SIZE>
+        mm<half, BS_K, BS_NPQ, BS_CRS, WS_K, WS_NPQ, MMAS_K, MMAS_NPQ, TS_K, TS_NPQ, WG_SIZE>
             <<<gridDim, blockDim, 0, stream>>>(p.Cout, NPQ, p.Cin * p.KW * p.KH, src0_data, src1_data, dst_data);
     } else {
         float *src0_data = (float *) src0->data;
-        mm<float, BS_K, BS_NPQ, BS_CRS, TS_K, TS_NPQ, WG_SIZE, VEC_SIZE>
+        mm<float, BS_K, BS_NPQ, BS_CRS, WS_K, WS_NPQ, MMAS_K, MMAS_NPQ, TS_K, TS_NPQ, WG_SIZE>
         <<<gridDim, blockDim, 0, stream>>>(p.Cout, NPQ, p.Cin * p.KW * p.KH, src0_data, src1_data, dst_data);
     }
 
@@ -452,6 +483,7 @@ void ggml_cuda_op_conv2d_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     uint32_t selected_variant_id = CONV_SHAPE_128x128;
 
+    /*
     if (elements[0] > 64 && variant_ntiles[CONV_SHAPE_128x128] >= sm_count * 2) {
         selected_variant_id = CONV_SHAPE_128x128;
     } else if (elements[0] <= 32 && variant_ntiles[CONV_SHAPE_32x256] >= sm_count * 2) {
@@ -459,6 +491,7 @@ void ggml_cuda_op_conv2d_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     } else {
         selected_variant_id = CONV_SHAPE_64x32;
     }
+    */
 
     conv2d_variants[selected_variant_id](ctx, src0, src1, dst, p);
 }
